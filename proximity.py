@@ -1139,7 +1139,110 @@ class ScanDevice(object):
         self.stopIt = True
 
 
-# This class does 'all the magic' like regular device detection and decision making
+# Smart scan function for CLI usage
+# Finds a suitable RFCOMM channel by looking for common phone services
+def smart_scan_services( identifier ):
+    """Scan for common phone services and return a usable RFCOMM channel.
+    
+    Args:
+        identifier: MAC address (XX:XX:XX:XX:XX:XX) or friendly device name
+    
+    Returns:
+        Tuple of (mac_address, channel) or (None, None) if not found
+    """
+    import re
+    
+    # Common services found on phones that use RFCOMM
+    common_services = [ "SMS/MMS", "OBEX", "CONTINUITY", "Phonebook", "Message Access", "Serial", "SPP" ]
+    
+    # Check if identifier is a MAC address
+    mac_pattern = re.compile( r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' )
+    
+    if mac_pattern.match( identifier ):
+        mac = identifier
+        print( _("Using MAC address: %s") % mac )
+    else:
+        # It's a friendly name, need to discover devices
+        import tempfile
+        
+        print( _("Searching for device named '%s'...") % identifier )
+        print( _("NOTE: Please ensure your phone is in DISCOVERABLE mode.") )
+        print( _("Waiting up to 60 seconds for device to appear...") )
+        
+        # Create a temp file path for signaling discovery
+        signal_file = os.path.join( tempfile.gettempdir(), 'blueproximity_discovered.tmp' )
+        
+        # Remove old signal file if exists
+        try:
+            os.remove( signal_file )
+        except:
+            pass
+        
+        mac = None
+        max_attempts = 120  # 60 seconds at 500ms intervals
+        attempt = 0
+        
+        while attempt < max_attempts and mac is None:
+            try:
+                # Quick scan (4 seconds)
+                nearby = bluetooth.discover_devices( duration=4, lookup_names=True, lookup_class=False )
+            except Exception as e:
+                print( _("Discovery attempt failed: %s") % str( e ) )
+                attempt += 8  # Account for scan time
+                time.sleep( 0.5 )
+                continue
+            
+            for addr, name in nearby:
+                print( _("Found: %s [%s]") % ( name, addr ) )
+                if identifier.lower() in name.lower():
+                    mac = addr
+                    print( _("MATCH: %s") % name )
+                    # Write signal file
+                    try:
+                        with open( signal_file, 'w' ) as f:
+                            f.write( mac )
+                    except:
+                        pass
+                    break
+            
+            if not mac:
+                attempt += 8  # Each scan is ~4 seconds
+                time.sleep( 0.5 )
+                attempt += 1
+        
+        if not mac:
+            print( _("Device '%s' not found after 60 seconds.") % identifier )
+            print( _("Please ensure your phone's Bluetooth is on and in discoverable mode.") )
+            return ( None, None )
+    
+    # Now search for services on the device
+    print( _("Scanning services on %s...") % mac )
+    try:
+        services = bluetooth.find_service( address=mac )
+    except Exception as e:
+        print( _("Service discovery failed: %s") % str( e ) )
+        return ( mac, None )
+    
+    if not services:
+        print( _("No services found on device.") )
+        return ( mac, None )
+    
+    # Look for matching services
+    for svc in services:
+        name = svc.get( "name", "" )
+        port = svc.get( "port", 0 )
+        
+        if name and port:
+            for target in common_services:
+                if target.lower() in name.lower():
+                    print( _("MATCH: Service '%s' on channel %d") % ( name, port ) )
+                    return ( mac, port )
+    
+    print( _("No matching common service found.") )
+    return ( mac, None )
+
+
+# This class does 'all the magic'
 # whether a device is known as present or away. Here is where all the bluetooth specific
 # part takes place. It is build to be run a a seperate thread and would run perfectly without any GUI.
 # Please note that the present-command is issued by the GUI whereas the locking and unlocking
@@ -1453,13 +1556,53 @@ if __name__ == '__main__':
         print(_("Creating new configuration."))
         print(_("Using config file '%s'.") % _('standard'))
 
+    configs.sort()
+
+    # CLI Scan Mode - check BEFORE starting threads
+    if len( sys.argv ) > 1 and sys.argv[1] == '--scan':
+        print( _("CLI Scan Mode") )
+        
+        # Get identifier from command line or use config
+        if len( sys.argv ) > 2:
+            identifier = ' '.join( sys.argv[2:] )  # Handle names with spaces
+            print( _("Scanning for: %s") % identifier )
+            mac, port = smart_scan_services( identifier )
+            
+            if mac and port:
+                # Update config if we have one
+                if configs:
+                    config = configs[0][1]
+                    config['device_mac'] = mac
+                    config['device_channel'] = port
+                    config.write()
+                    print( _("Config updated: MAC=%s, Channel=%d") % ( mac, port ) )
+            else:
+                print( _("Scan failed or no suitable service found.") )
+        else:
+            # Scan using existing config MACs
+            for conf in configs:
+                name = conf[0]
+                config = conf[1]
+                mac = config['device_mac']
+                
+                if mac:
+                    print( _("Config '%s': Scanning %s") % ( name, mac ) )
+                    _, port = smart_scan_services( mac )
+                    
+                    if port:
+                        config['device_channel'] = port
+                        config.write()
+                        print( _("Updated channel to %d") % port )
+                else:
+                    print( _("Config '%s': No MAC configured.") % name )
+        
+        sys.exit( 0 )
+
     # now start the proximity detection for each configuration
     for config in configs:
-        p = Proximity(config[1])
+        p = Proximity( config[1] )
         p.start()
-        config.append(p)
-
-    configs.sort()
+        config.append( p )
 
     # the idea behind 'configs' is an array containing the name, the configobj and the proximity object
     pGui = ProximityGUI(configs, new_config)
